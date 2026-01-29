@@ -1,0 +1,6 @@
+model,tmr,n
+/root/autodl-tmp/LLaVA-ori,0.985,200
+/root/autodl-tmp/LLaVAs/LLaVA-CUB,0.315,200
+/root/autodl-tmp/LLaVAs/LLaVA-Mantis,0.0,200
+/root/autodl-tmp/LLaVAs/LLaVA-pruned,0.0,200
+/root/autodl-tmp/LLaVAs/LLaVA-v4,0.005,200
