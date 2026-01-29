@@ -249,6 +249,7 @@ def pla_attack(
     question_text: str,
     target_text: str,
     cfg: PLAConfig,
+    record_losses: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -281,6 +282,8 @@ def pla_attack(
 
     # 用 processor 当前 strategy；避免 model.config 默认值（某些 ckpt 是 "full"）导致 forward mismatch
     vfs = getattr(processor, "vision_feature_select_strategy", None)
+
+    losses = [] if record_losses else None
 
     for step in tqdm(range(cfg.steps)):
         x.requires_grad_(True)
@@ -323,6 +326,8 @@ def pla_attack(
             x = x.clamp(0.0, 1.0)
 
         cur_loss = float(loss.detach().cpu())
+        if losses is not None:
+            losses.append(cur_loss)
         if cur_loss < best_loss:
             best_loss = cur_loss
             best_x = x.clone().detach()
@@ -343,4 +348,6 @@ def pla_attack(
         "target": target_text,
         "prompt": prompt,
     }
+    if losses is not None:
+        info["losses"] = losses
     return best_x.to(dtype=torch.float32), info

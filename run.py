@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=200)
     ap.add_argument("--out_dir", type=str, default="./pla_runs/run1")
     ap.add_argument("--save_triggers", default=True)
+    ap.add_argument("--save_loss_curves", action="store_true", help="Save per-image loss curves to a separate folder")
     ap.add_argument("--model_format", type=str, default="auto", choices=["auto", "hf", "llava"])
     ap.add_argument("--model_base", type=str, default=None, help="Base model path for official LLaVA checkpoints")
     args = ap.parse_args()
@@ -132,6 +133,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     trig_dir = out_dir / "triggers"
     trig_dir.mkdir(parents=True, exist_ok=True)
+    loss_dir = out_dir / "loss_curves"
+    if args.save_loss_curves:
+        loss_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) sample images
     all_imgs = list_images_imagenette(args.imagenette_dir)
@@ -208,6 +212,7 @@ def main():
                 question_text=args.question,
                 target_text=args.target,
                 cfg=cfg,
+                record_losses=args.save_loss_curves,
                 device=args.device,
                 dtype=dtype,
                 done=idx,
@@ -216,6 +221,12 @@ def main():
 
             img_id = f"{idx:04d}"
             triggers.append((img_id, adv_x.cpu(), info))
+
+            if args.save_loss_curves:
+                losses = info.pop("losses", None)
+                if losses is not None:
+                    loss_path = loss_dir / f"{img_id}.json"
+                    loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
 
             meta = {"image_id": img_id, "src_path": img_path, **info}
             trigger_meta.append(meta)
