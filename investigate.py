@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Iterable
 
 import torch
 
@@ -134,14 +134,82 @@ def compute_drift_stats(
     return global_stats, layers
 
 
-def choose_image(imagenette_dir: str, seed: int, image_path: str | None, index: int) -> str:
+def choose_images(
+    imagenette_dir: str,
+    seed: int,
+    image_path: str | None,
+    index: int,
+    count: int,
+) -> List[str]:
     if image_path:
-        return image_path
+        return [image_path] * count
     all_imgs = list_images_imagenette(imagenette_dir)
     if not all_imgs:
         raise RuntimeError(f"No images found under {imagenette_dir}")
-    sampled = sample_images(all_imgs, max(index + 1, 1), seed=seed)
-    return sampled[index]
+    needed = max(index + count, 1)
+    sampled = sample_images(all_imgs, needed, seed=seed)
+    return sampled[index : index + count]
+
+
+def _numeric_keys(d: Dict[str, Any]) -> List[str]:
+    out = []
+    for k, v in d.items():
+        if isinstance(v, (int, float)):
+            out.append(k)
+    return out
+
+
+def _mean_std(values: Iterable[float]) -> Tuple[float, float]:
+    vals = list(values)
+    if not vals:
+        return 0.0, 0.0
+    mean = sum(vals) / len(vals)
+    var = sum((x - mean) ** 2 for x in vals) / len(vals)
+    return mean, var ** 0.5
+
+
+def aggregate_global_stats(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not stats_list:
+        return {}
+    keys = _numeric_keys(stats_list[0])
+    out = {}
+    for k in keys:
+        vals = [float(s.get(k, 0.0)) for s in stats_list]
+        mean, std = _mean_std(vals)
+        out[f"{k}_mean"] = mean
+        out[f"{k}_std"] = std
+        out[f"{k}_min"] = min(vals)
+        out[f"{k}_max"] = max(vals)
+    return out
+
+
+def aggregate_layer_stats(layers_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not layers_list:
+        return {}
+    common = set(layers_list[0].keys())
+    for l in layers_list[1:]:
+        common &= set(l.keys())
+
+    out: Dict[str, Any] = {}
+    for name in sorted(common):
+        per = [l[name] for l in layers_list]
+        if any(p.get("mismatch") for p in per):
+            out[name] = {"mismatch": True}
+            continue
+        keys = [k for k in _numeric_keys(per[0]) if k != "numel"]
+        stats = {
+            "shape": per[0].get("shape"),
+            "numel": per[0].get("numel"),
+        }
+        for k in keys:
+            vals = [float(p.get(k, 0.0)) for p in per if p.get(k) is not None]
+            mean, std = _mean_std(vals)
+            stats[f"{k}_mean"] = mean
+            stats[f"{k}_std"] = std
+            stats[f"{k}_min"] = min(vals) if vals else 0.0
+            stats[f"{k}_max"] = max(vals) if vals else 0.0
+        out[name] = stats
+    return out
 
 
 def main() -> None:
@@ -149,6 +217,7 @@ def main() -> None:
     ap.add_argument("--imagenette_dir", type=str, default="/root/autodl-tmp/imagenette/imagenette2/val")
     ap.add_argument("--image_path", type=str, default=None, help="Optional explicit image path for PLA")
     ap.add_argument("--image_index", type=int, default=0)
+    ap.add_argument("--pla_runs", type=int, default=1)
     ap.add_argument("--base_model", type=str, required=True)
     ap.add_argument("--finetuned_root", type=str, default=None)
     ap.add_argument("--question", type=str, default="Detecting copyright.")
@@ -196,8 +265,13 @@ def main() -> None:
     }
 
     if args.run_pla:
-        img_path = choose_image(args.imagenette_dir, args.seed, args.image_path, args.image_index)
-        pil_img = pil_load(img_path)
+        img_paths = choose_images(
+            args.imagenette_dir,
+            args.seed,
+            args.image_path,
+            args.image_index,
+            args.pla_runs,
+        )
 
         cfg = PLAConfig(
             steps=args.steps,
@@ -209,42 +283,83 @@ def main() -> None:
             seed=args.seed,
         )
 
-        adv_x, info = pla_attack(
-            model=base_model,
-            processor=base_processor,
-            pil_image=pil_img,
-            question_text=args.question,
-            target_text=args.target,
-            cfg=cfg,
-            record_losses=False,
-            device=args.device,
-            dtype=dtype,
-            done=0,
-            todo=1,
-        )
-        _ = adv_x
+        pla_dir = drift_dir / "pla_runs"
+        pla_dir.mkdir(parents=True, exist_ok=True)
 
-        global_stats, layers = compute_drift_stats(
-            base_state,
-            base_model.state_dict(),
-            args.compute_rank,
-            args.rank_max_dim,
-            args.rank_max_numel,
-        )
+        pla_globals = []
+        pla_layers = []
+        pla_files = []
 
-        payload = {
+        for i, img_path in enumerate(img_paths):
+            with torch.no_grad():
+                base_model.load_state_dict(base_state, strict=True)
+
+            pil_img = pil_load(img_path)
+
+            adv_x, info = pla_attack(
+                model=base_model,
+                processor=base_processor,
+                pil_image=pil_img,
+                question_text=args.question,
+                target_text=args.target,
+                cfg=cfg,
+                record_losses=False,
+                device=args.device,
+                dtype=dtype,
+                done=i,
+                todo=len(img_paths),
+            )
+            _ = adv_x
+
+            global_stats, layers = compute_drift_stats(
+                base_state,
+                base_model.state_dict(),
+                args.compute_rank,
+                args.rank_max_dim,
+                args.rank_max_numel,
+            )
+            pla_globals.append(global_stats)
+            pla_layers.append(layers)
+
+            payload = {
+                "meta": {
+                    **meta_common,
+                    "mode": "pla",
+                    "run_index": i,
+                    "image_path": img_path,
+                    "question": args.question,
+                    "target": args.target,
+                    "attack_config": info,
+                },
+                "global": global_stats,
+                "layers": layers,
+            }
+            out_path = pla_dir / f"pla_{i:03d}.json"
+            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            pla_files.append(str(out_path))
+
+        summary = {
             "meta": {
                 **meta_common,
                 "mode": "pla",
-                "image_path": img_path,
+                "runs": len(img_paths),
+                "image_paths": img_paths,
                 "question": args.question,
                 "target": args.target,
-                "attack_config": info,
+                "attack_config": {
+                    "steps": cfg.steps,
+                    "epsilon": cfg.epsilon,
+                    "alpha": cfg.alpha,
+                    "model_lr": cfg.model_lr,
+                    "model_grad_clip": cfg.model_grad_clip,
+                    "reg_lambda": cfg.reg_lambda,
+                },
+                "per_run_files": pla_files,
             },
-            "global": global_stats,
-            "layers": layers,
+            "global_agg": aggregate_global_stats(pla_globals),
+            "layers_agg": aggregate_layer_stats(pla_layers),
         }
-        (drift_dir / "pla_drift.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (drift_dir / "pla_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if args.finetuned_root:
         fin_dir = drift_dir / "finetuned"
