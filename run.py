@@ -152,40 +152,56 @@ def main():
 
     triggers_json = out_dir / "triggers.json"
 
-    # If triggers exist, reuse them
-    if triggers_json.exists() and (trig_dir.exists()) and (len(list(trig_dir.glob("*.png"))) > 0):
-        print(f"[reuse] Found existing triggers under {trig_dir}, loading and skipping attack.")
+    existing_pngs = sorted(trig_dir.glob("*.png"))
+    existing_ids = []
+    for p in existing_pngs:
+        try:
+            existing_ids.append(int(p.stem))
+        except ValueError:
+            continue
+    existing_ids = sorted(set(existing_ids))
 
+    meta_by_id: Dict[str, Dict[str, Any]] = {}
+    if triggers_json.exists():
         trigger_meta = json.loads(triggers_json.read_text(encoding="utf-8"))
+        meta_by_id = {m.get("image_id"): m for m in trigger_meta if m.get("image_id") is not None}
+    elif existing_ids:
+        print(f"[warn] Found triggers under {trig_dir} but no triggers.json; metadata will be partial.")
 
+    if existing_ids:
+        print(f"[reuse] Found {len(existing_ids)} existing triggers under {trig_dir}.")
         to_tensor = ToTensor()
-        for meta in trigger_meta:
-            img_id = meta["image_id"]
+        for idx in existing_ids:
+            if idx >= args.num_images:
+                continue
+            img_id = f"{idx:04d}"
             png_path = trig_dir / f"{img_id}.png"
             if not png_path.exists():
-                raise RuntimeError(f"Missing trigger file: {png_path}")
+                continue
 
-            # load png -> (1,3,H,W) float in [0,1]
             pil = Image.open(png_path).convert("RGB")
             adv_x = to_tensor(pil).unsqueeze(0)
 
-            # info should be what pla_attack saved (prompt/target included in meta)
+            meta = meta_by_id.get(img_id, {})
             info = {
                 "steps": meta.get("steps"),
                 "epsilon": meta.get("epsilon"),
                 "alpha": meta.get("alpha"),
-                "model_lr": meta.get("model_lr", meta.get("beta")),
-                "model_grad_clip": meta.get("model_grad_clip", meta.get("grad_clip")),
+                "model_lr": meta.get("model_lr"),
+                "model_grad_clip": meta.get("model_grad_clip"),
                 "reg_lambda": meta.get("reg_lambda", 0.0),
                 "best_loss": meta.get("best_loss"),
-                "question": meta.get("question"),
-                "target": meta.get("target"),
+                "question": meta.get("question", args.question),
+                "target": meta.get("target", args.target),
                 "prompt": meta.get("prompt"),
             }
 
             triggers.append((img_id, adv_x, info))
 
-    else:
+        if len(existing_ids) >= args.num_images:
+            print(f"[reuse] Already have {len(existing_ids)} triggers, target is {args.num_images}.")
+
+    if len(triggers) < args.num_images:
         # 2) load base and craft triggers
         base_model, base_processor = load_llava(
             args.base_model,
@@ -196,13 +212,17 @@ def main():
         )
         base_state = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
 
-        # 1) sample images (you already did this above)
+        missing_indices = [i for i in range(args.num_images) if i not in existing_ids]
+        if not missing_indices:
+            print("[attack] No missing triggers to generate.")
+
         if args.batch_size <= 1:
-            for idx, img_path in enumerate(sampled):
+            for idx in missing_indices:
                 # Reset model to initial weights for each image (matches PLA setup)
                 with torch.no_grad():
                     base_model.load_state_dict(base_state, strict=True)
 
+                img_path = sampled[idx]
                 pil_img = pil_load(img_path)
 
                 adv_x, info = pla_attack(
@@ -216,7 +236,7 @@ def main():
                     device=args.device,
                     dtype=dtype,
                     done=idx,
-                    todo=len(sampled),
+                    todo=args.num_images,
                 )
 
                 img_id = f"{idx:04d}"
@@ -229,18 +249,20 @@ def main():
                         loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 meta = {"image_id": img_id, "src_path": img_path, **info}
-                trigger_meta.append(meta)
+                meta_by_id[img_id] = meta
 
                 if args.save_triggers:
                     from torchvision.utils import save_image
                     save_image(adv_x.cpu(), str(trig_dir / f"{img_id}.png"))
 
                 if (idx + 1) % 10 == 0:
-                    print(f"[attack] {idx+1}/{len(sampled)} done")
+                    print(f"[attack] {idx+1}/{args.num_images} done")
         else:
-            for start in range(0, len(sampled), args.batch_size):
-                end = min(start + args.batch_size, len(sampled))
-                batch_paths = sampled[start:end]
+            for start in range(0, len(missing_indices), args.batch_size):
+                batch_indices = missing_indices[start:start + args.batch_size]
+                if not batch_indices:
+                    break
+                batch_paths = [sampled[i] for i in batch_indices]
 
                 with torch.no_grad():
                     base_model.load_state_dict(base_state, strict=True)
@@ -260,7 +282,7 @@ def main():
                 )
 
                 for i, (adv_x, info, img_path) in enumerate(zip(adv_list, info_list, batch_paths)):
-                    idx = start + i
+                    idx = batch_indices[i]
                     img_id = f"{idx:04d}"
                     triggers.append((img_id, adv_x.cpu(), info))
 
@@ -271,19 +293,22 @@ def main():
                             loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
 
                     meta = {"image_id": img_id, "src_path": img_path, **info}
-                    trigger_meta.append(meta)
+                    meta_by_id[img_id] = meta
 
                     if args.save_triggers:
                         from torchvision.utils import save_image
                         save_image(adv_x.cpu(), str(trig_dir / f"{img_id}.png"))
 
-                if end % 10 == 0:
-                    print(f"[attack] {end}/{len(sampled)} done")
+                done_count = min(batch_indices[-1] + 1, args.num_images)
+                if done_count % 10 == 0:
+                    print(f"[attack] {done_count}/{args.num_images} done")
 
         # cleanup base model to free VRAM before evaluation
         del base_model
         torch.cuda.empty_cache()
 
+        if meta_by_id:
+            trigger_meta = [meta_by_id[k] for k in sorted(meta_by_id.keys())]
         (out_dir / "triggers.json").write_text(json.dumps(trigger_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 3) evaluate base + finetuned
