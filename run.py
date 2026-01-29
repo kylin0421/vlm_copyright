@@ -200,9 +200,14 @@ def main():
             model_format=args.model_format,
             model_base=args.model_base,
         )
+        base_state = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
 
         # 1) sample images (you already did this above)
         for idx, img_path in enumerate(sampled):
+            # Reset model to initial weights for each image (matches PLA setup)
+            with torch.no_grad():
+                base_model.load_state_dict(base_state, strict=True)
+
             pil_img = pil_load(img_path)
 
             adv_x, info = pla_attack(
