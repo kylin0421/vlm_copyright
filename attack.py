@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 from tqdm import tqdm
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, LlavaForConditionalGeneration
+from transformers import LlavaForConditionalGeneration
 from torchvision.transforms.functional import to_pil_image
 from transformers.utils.generic import ModelOutput
 
@@ -26,8 +24,9 @@ class PLAConfig:
     steps: int = 1000
     epsilon: float = 16 / 255
     alpha: float = 1 / 255
-    beta: float = 1e-4
-    grad_clip: float = 5e-3
+    model_lr: float = 1e-4
+    model_grad_clip: float = 5e-3
+    reg_lambda: float = 0.0
     # optional: if you want deterministic
     seed: Optional[int] = 0
 
@@ -52,25 +51,6 @@ def ensure_llava_processor_config(model: LlavaForConditionalGeneration, processo
         # 再退回 processor 自己已有的；否则按 LLaVA-1.5 常见值 0
         nai = getattr(processor, "num_additional_image_tokens", 0)
     processor.num_additional_image_tokens = int(nai)
-
-
-def load_llava(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.float16):
-    """
-    Load a LLaVA model checkpoint (base or finetuned) in HF format.
-
-    Returns: (model, processor)
-    """
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
-    model = LlavaForConditionalGeneration.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
-    model.to(device)
-    model.eval()
-    ensure_llava_processor_config(model, processor)
-
-    return model, processor
 
 
 def _count_image_tokens(processor, input_ids: torch.Tensor) -> int:
@@ -238,6 +218,7 @@ def llava_generate(
     dtype: torch.dtype,
     max_new_tokens: int = 200,
 ) -> str:
+    ensure_llava_processor_config(model, processor)
     # prompt 和图像都交给同一个 processor 来产出 matched inputs
     img_pil = to_pil_image(image_tensor_01.squeeze(0).detach().cpu())
 
@@ -306,6 +287,7 @@ def pla_attack(
 
         pixel_values = normalize_for_llava(processor, x).to(device=device, dtype=dtype)
 
+        model.zero_grad(set_to_none=True)
         outputs = model(
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs.get("attention_mask", None),
@@ -315,19 +297,28 @@ def pla_attack(
         )
         loss = outputs.loss
 
-        reg = (x - x0).pow(2).mean()
-        total = loss + cfg.beta * reg
+        if cfg.reg_lambda > 0:
+            reg = (x - x0).pow(2).mean()
+            total = loss + cfg.reg_lambda * reg
+        else:
+            total = loss
 
         total.backward()
 
-        if x.grad is not None and cfg.grad_clip is not None and cfg.grad_clip > 0:
-            g = x.grad
-            g = g.clamp(min=-cfg.grad_clip, max=cfg.grad_clip)
-        else:
-            g = x.grad
-
         with torch.no_grad():
-            x = x - cfg.alpha * g.sign()
+            # Update model parameters (PLA) with gradient ascent on loss
+            if cfg.model_lr and cfg.model_lr > 0:
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    g = p.grad
+                    if cfg.model_grad_clip and cfg.model_grad_clip > 0:
+                        g = g.clamp(min=-cfg.model_grad_clip, max=cfg.model_grad_clip)
+                    p.add_(cfg.model_lr * g)
+
+            # Update image with FGSM-style sign step
+            if x.grad is not None:
+                x = x - cfg.alpha * x.grad.sign()
             x = torch.max(torch.min(x, x0 + cfg.epsilon), x0 - cfg.epsilon)
             x = x.clamp(0.0, 1.0)
 
@@ -344,8 +335,9 @@ def pla_attack(
         "steps": cfg.steps,
         "epsilon": cfg.epsilon,
         "alpha": cfg.alpha,
-        "beta": cfg.beta,
-        "grad_clip": cfg.grad_clip,
+        "model_lr": cfg.model_lr,
+        "model_grad_clip": cfg.model_grad_clip,
+        "reg_lambda": cfg.reg_lambda,
         "best_loss": best_loss,
         "question": question_text,
         "target": target_text,

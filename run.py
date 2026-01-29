@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import json
 import csv
 from pathlib import Path
@@ -14,18 +13,28 @@ import torch
 from torchvision.transforms import ToTensor
 from PIL import Image
 
-from attack import load_llava, pla_attack, llava_generate, PLAConfig
-from utils import list_images_imagenette, sample_images, pil_load, preprocess_image_to_tensor, build_chat_prompt_with_image
+from attack import pla_attack, llava_generate, PLAConfig
+from model_loader import load_llava
+from utils import list_images_imagenette, sample_images, pil_load, build_chat_prompt_with_image
 
 
 def find_model_dirs(root: str) -> List[str]:
     """
-    Find candidate model directories under root: each direct subdir that contains config.json.
+    Find candidate model directories under root.
+    Accept both HF (config.json) and official LLaVA checkpoints (pytorch_model.bin/mm_projector.bin).
     """
     root_p = Path(root)
     out = []
     for p in sorted(root_p.iterdir()):
-        if p.is_dir() and (p / "config.json").exists():
+        if not p.is_dir():
+            continue
+        if (p / "config.json").exists():
+            out.append(str(p))
+            continue
+        if (p / "pytorch_model.bin").exists() or (p / "mm_projector.bin").exists():
+            out.append(str(p))
+            continue
+        if any(p.glob("model*.safetensors")):
             out.append(str(p))
     return out
 
@@ -41,12 +50,20 @@ def evaluate_model_on_triggers(
     device: str,
     dtype: torch.dtype,
     max_new_tokens: int,
+    model_format: str,
+    model_base: str | None,
 ) -> Dict[str, Any]:
     """
     Evaluate one model on a list of trigger images.
     triggers: list of (image_id, adv_image_01_tensor, info)
     """
-    model, processor = load_llava(model_path, device=device, dtype=dtype)
+    model, processor = load_llava(
+        model_path,
+        device=device,
+        dtype=dtype,
+        model_format=model_format,
+        model_base=model_base,
+    )
     tmr_hits = 0
     outputs_preview = []
 
@@ -90,16 +107,26 @@ def main():
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--epsilon", type=float, default=16/255)
     ap.add_argument("--alpha", type=float, default=1/255)
-    ap.add_argument("--beta", type=float, default=1e-4)
-    ap.add_argument("--grad_clip", type=float, default=5e-3)
+    ap.add_argument("--model_lr", type=float, default=1e-4)
+    ap.add_argument("--beta", type=float, default=None, help="Deprecated alias for --model_lr")
+    ap.add_argument("--model_grad_clip", type=float, default=5e-3)
+    ap.add_argument("--grad_clip", type=float, default=None, help="Deprecated alias for --model_grad_clip")
+    ap.add_argument("--reg_lambda", type=float, default=0.0)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     ap.add_argument("--max_new_tokens", type=int, default=200)
     ap.add_argument("--out_dir", type=str, default="./pla_runs/run1")
     ap.add_argument("--save_triggers", default=True)
+    ap.add_argument("--model_format", type=str, default="auto", choices=["auto", "hf", "llava"])
+    ap.add_argument("--model_base", type=str, default=None, help="Base model path for official LLaVA checkpoints")
     args = ap.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
+
+    if args.beta is not None and args.model_lr == 1e-4:
+        args.model_lr = args.beta
+    if args.grad_clip is not None and args.model_grad_clip == 5e-3:
+        args.model_grad_clip = args.grad_clip
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -112,15 +139,13 @@ def main():
         raise RuntimeError(f"No images found under {args.imagenette_dir}")
     sampled = sample_images(all_imgs, args.num_images, seed=args.seed)
 
-    # 2) load base and craft triggers
-    base_model, base_processor = load_llava(args.base_model, device=args.device, dtype=dtype)
-
     cfg = PLAConfig(
         steps=args.steps,
         epsilon=args.epsilon,
         alpha=args.alpha,
-        beta=args.beta,
-        grad_clip=args.grad_clip,
+        model_lr=args.model_lr,
+        model_grad_clip=args.model_grad_clip,
+        reg_lambda=args.reg_lambda,
         seed=args.seed,
     )
 
@@ -151,8 +176,9 @@ def main():
                 "steps": meta.get("steps"),
                 "epsilon": meta.get("epsilon"),
                 "alpha": meta.get("alpha"),
-                "beta": meta.get("beta"),
-                "grad_clip": meta.get("grad_clip"),
+                "model_lr": meta.get("model_lr", meta.get("beta")),
+                "model_grad_clip": meta.get("model_grad_clip", meta.get("grad_clip")),
+                "reg_lambda": meta.get("reg_lambda", 0.0),
                 "best_loss": meta.get("best_loss"),
                 "question": meta.get("question"),
                 "target": meta.get("target"),
@@ -163,15 +189,12 @@ def main():
 
     else:
         # 2) load base and craft triggers
-        base_model, base_processor = load_llava(args.base_model, device=args.device, dtype=dtype)
-
-        cfg = PLAConfig(
-            steps=args.steps,
-            epsilon=args.epsilon,
-            alpha=args.alpha,
-            beta=args.beta,
-            grad_clip=args.grad_clip,
-            seed=args.seed,
+        base_model, base_processor = load_llava(
+            args.base_model,
+            device=args.device,
+            dtype=dtype,
+            model_format=args.model_format,
+            model_base=args.model_base,
         )
 
         # 1) sample images (you already did this above)
@@ -224,6 +247,8 @@ def main():
             device=args.device,
             dtype=dtype,
             max_new_tokens=args.max_new_tokens,
+            model_format=args.model_format,
+            model_base=args.model_base,
         )
         results.append({"model": mp, "tmr": r["tmr"], "n": r["n"]})
         previews[mp] = r["preview"]
