@@ -33,10 +33,27 @@ def mean_curve(losses: List[List[float]]) -> List[float]:
     return out
 
 
+def smooth_curve(values: List[float], window: int) -> List[float]:
+    if window <= 1:
+        return values
+    out = []
+    acc = 0.0
+    q = []
+    for v in values:
+        q.append(v)
+        acc += v
+        if len(q) > window:
+            acc -= q.pop(0)
+        out.append(acc / len(q))
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--loss_dir", type=str, required=True, help="Folder with per-image loss JSON files")
     ap.add_argument("--out_png", type=str, required=True, help="Output PNG path")
+    ap.add_argument("--smooth", type=int, default=1, help="Moving average window size (>=1)")
+    ap.add_argument("--logy", action="store_true", help="Use log scale for y-axis")
     args = ap.parse_args()
 
     loss_dir = Path(args.loss_dir)
@@ -50,11 +67,15 @@ def main() -> None:
     if not avg:
         raise SystemExit("Loss curves are empty after alignment.")
 
+    avg = smooth_curve(avg, args.smooth)
+
     plt.figure(figsize=(8, 4.5))
     plt.plot(avg, linewidth=2)
     plt.xlabel("Step")
     plt.ylabel("Average loss")
     plt.title(f"Mean loss over {len(losses)} samples")
+    if args.logy:
+        plt.yscale("log")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_png, dpi=200)
