@@ -7,13 +7,12 @@ import csv
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import argparse
-from tqdm import tqdm
 
 import torch
 from torchvision.transforms import ToTensor
 from PIL import Image
 
-from attack import pla_attack, llava_generate, PLAConfig
+from attack import pla_attack, pla_attack_batch, llava_generate, PLAConfig
 from model_loader import load_llava
 from utils import list_images_imagenette, sample_images, pil_load, build_chat_prompt_with_image
 
@@ -102,32 +101,27 @@ def main():
     ap.add_argument("--finetuned_root", type=str, default='/root/autodl-tmp/LLaVAs', help="Path to root folder containing finetuned model subdirs")
     ap.add_argument("--question", type=str, default='Detecting copyright.', help="Prompt trigger text (user question)")
     ap.add_argument("--target", type=str, default='CVPR conference', help="Target output text used in attack & evaluation")
-    ap.add_argument("--num_images", type=int, default=200, help="Number of Imagenette images to sample (paper uses 200)")
+    ap.add_argument("--num_images", type=int, default=100, help="Number of Imagenette images to sample")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--epsilon", type=float, default=16/255)
     ap.add_argument("--alpha", type=float, default=1/255)
     ap.add_argument("--model_lr", type=float, default=1e-4)
-    ap.add_argument("--beta", type=float, default=None, help="Deprecated alias for --model_lr")
     ap.add_argument("--model_grad_clip", type=float, default=5e-3)
-    ap.add_argument("--grad_clip", type=float, default=None, help="Deprecated alias for --model_grad_clip")
     ap.add_argument("--reg_lambda", type=float, default=0.0)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     ap.add_argument("--max_new_tokens", type=int, default=200)
     ap.add_argument("--out_dir", type=str, default="./pla_runs/run1")
     ap.add_argument("--save_triggers", default=True)
-    ap.add_argument("--save_loss_curves", action="store_true", help="Save per-image loss curves to a separate folder")
+    ap.add_argument("--save_loss_curves", action="store_true", default=True, help="Save per-image loss curves to a separate folder")
+    ap.add_argument("--no_save_loss_curves", dest="save_loss_curves", action="store_false", help="Disable loss curves saving")
+    ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--model_format", type=str, default="auto", choices=["auto", "hf", "llava"])
     ap.add_argument("--model_base", type=str, default=None, help="Base model path for official LLaVA checkpoints")
     args = ap.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
-
-    if args.beta is not None and args.model_lr == 1e-4:
-        args.model_lr = args.beta
-    if args.grad_clip is not None and args.model_grad_clip == 5e-3:
-        args.model_grad_clip = args.grad_clip
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -203,45 +197,88 @@ def main():
         base_state = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
 
         # 1) sample images (you already did this above)
-        for idx, img_path in enumerate(sampled):
-            # Reset model to initial weights for each image (matches PLA setup)
-            with torch.no_grad():
-                base_model.load_state_dict(base_state, strict=True)
+        if args.batch_size <= 1:
+            for idx, img_path in enumerate(sampled):
+                # Reset model to initial weights for each image (matches PLA setup)
+                with torch.no_grad():
+                    base_model.load_state_dict(base_state, strict=True)
 
-            pil_img = pil_load(img_path)
+                pil_img = pil_load(img_path)
 
-            adv_x, info = pla_attack(
-                model=base_model,
-                processor=base_processor,
-                pil_image=pil_img,
-                question_text=args.question,
-                target_text=args.target,
-                cfg=cfg,
-                record_losses=args.save_loss_curves,
-                device=args.device,
-                dtype=dtype,
-                done=idx,
-                todo=len(sampled),
-            )
+                adv_x, info = pla_attack(
+                    model=base_model,
+                    processor=base_processor,
+                    pil_image=pil_img,
+                    question_text=args.question,
+                    target_text=args.target,
+                    cfg=cfg,
+                    record_losses=args.save_loss_curves,
+                    device=args.device,
+                    dtype=dtype,
+                    done=idx,
+                    todo=len(sampled),
+                )
 
-            img_id = f"{idx:04d}"
-            triggers.append((img_id, adv_x.cpu(), info))
+                img_id = f"{idx:04d}"
+                triggers.append((img_id, adv_x.cpu(), info))
 
-            if args.save_loss_curves:
-                losses = info.pop("losses", None)
-                if losses is not None:
-                    loss_path = loss_dir / f"{img_id}.json"
-                    loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
+                if args.save_loss_curves:
+                    losses = info.pop("losses", None)
+                    if losses is not None:
+                        loss_path = loss_dir / f"{img_id}.json"
+                        loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            meta = {"image_id": img_id, "src_path": img_path, **info}
-            trigger_meta.append(meta)
+                meta = {"image_id": img_id, "src_path": img_path, **info}
+                trigger_meta.append(meta)
 
-            if args.save_triggers:
-                from torchvision.utils import save_image
-                save_image(adv_x.cpu(), str(trig_dir / f"{img_id}.png"))
+                if args.save_triggers:
+                    from torchvision.utils import save_image
+                    save_image(adv_x.cpu(), str(trig_dir / f"{img_id}.png"))
 
-            if (idx + 1) % 10 == 0:
-                print(f"[attack] {idx+1}/{len(sampled)} done")
+                if (idx + 1) % 10 == 0:
+                    print(f"[attack] {idx+1}/{len(sampled)} done")
+        else:
+            for start in range(0, len(sampled), args.batch_size):
+                end = min(start + args.batch_size, len(sampled))
+                batch_paths = sampled[start:end]
+
+                with torch.no_grad():
+                    base_model.load_state_dict(base_state, strict=True)
+
+                pil_imgs = [pil_load(p) for p in batch_paths]
+
+                adv_list, info_list = pla_attack_batch(
+                    model=base_model,
+                    processor=base_processor,
+                    pil_images=pil_imgs,
+                    question_text=args.question,
+                    target_text=args.target,
+                    cfg=cfg,
+                    record_losses=args.save_loss_curves,
+                    device=args.device,
+                    dtype=dtype,
+                )
+
+                for i, (adv_x, info, img_path) in enumerate(zip(adv_list, info_list, batch_paths)):
+                    idx = start + i
+                    img_id = f"{idx:04d}"
+                    triggers.append((img_id, adv_x.cpu(), info))
+
+                    if args.save_loss_curves:
+                        losses = info.pop("losses", None)
+                        if losses is not None:
+                            loss_path = loss_dir / f"{img_id}.json"
+                            loss_path.write_text(json.dumps({"loss": losses}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                    meta = {"image_id": img_id, "src_path": img_path, **info}
+                    trigger_meta.append(meta)
+
+                    if args.save_triggers:
+                        from torchvision.utils import save_image
+                        save_image(adv_x.cpu(), str(trig_dir / f"{img_id}.png"))
+
+                if end % 10 == 0:
+                    print(f"[attack] {end}/{len(sampled)} done")
 
         # cleanup base model to free VRAM before evaluation
         del base_model

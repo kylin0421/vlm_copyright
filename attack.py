@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from tqdm import tqdm
 import torch
-import torch.nn as nn
 from transformers import LlavaForConditionalGeneration
 from torchvision.transforms.functional import to_pil_image
 from transformers.utils.generic import ModelOutput
@@ -351,3 +350,165 @@ def pla_attack(
     if losses is not None:
         info["losses"] = losses
     return best_x.to(dtype=torch.float32), info
+
+
+def _prepare_text_inputs_and_labels_batch(processor, pil_images, prompt: str, target_text: str, device: str):
+    batch = len(pil_images)
+    prompt_texts = [prompt] * batch
+    full_texts = [prompt + target_text] * batch
+
+    prompt_inputs = processor(
+        images=pil_images,
+        text=prompt_texts,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    full_inputs = processor(
+        images=pil_images,
+        text=full_texts,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+
+    prompt_inputs = {k: v.to(device) for k, v in prompt_inputs.items() if k in ["input_ids", "attention_mask"]}
+    full_inputs = {k: v.to(device) for k, v in full_inputs.items() if k in ["input_ids", "attention_mask"]}
+
+    input_ids = full_inputs["input_ids"]
+    attention_mask = full_inputs.get("attention_mask", None)
+
+    labels = input_ids.clone()
+    pl = prompt_inputs["input_ids"].shape[1]
+    labels[:, :pl] = -100
+
+    text_inputs = {"input_ids": input_ids}
+    if attention_mask is not None:
+        text_inputs["attention_mask"] = attention_mask
+    return text_inputs, labels
+
+
+def _per_sample_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    vocab = shift_logits.shape[-1]
+    loss_flat = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, vocab),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    )
+    loss = loss_flat.view(shift_labels.shape)
+    mask = shift_labels.ne(-100)
+    denom = mask.sum(dim=1).clamp(min=1)
+    return (loss * mask).sum(dim=1) / denom
+
+
+def pla_attack_batch(
+    model: LlavaForConditionalGeneration,
+    processor,
+    pil_images: List,
+    question_text: str,
+    target_text: str,
+    cfg: PLAConfig,
+    record_losses: bool = False,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
+) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+    if cfg.seed is not None:
+        torch.manual_seed(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    ensure_llava_processor_config(model, processor)
+
+    prompt = build_chat_prompt_with_image(processor, question_text)
+
+    x0_list = [preprocess_image_to_tensor(processor, im) for im in pil_images]
+    x0 = torch.cat(x0_list, dim=0).to(device=device, dtype=torch.float32)
+    x = x0.clone().detach()
+
+    text_inputs, labels = _prepare_text_inputs_and_labels_batch(
+        processor, pil_images, prompt, target_text, device=device
+    )
+
+    best_loss = torch.full((x.shape[0],), float("inf"), device=device)
+    best_x = x.clone().detach()
+
+    vfs = getattr(processor, "vision_feature_select_strategy", None)
+
+    losses = [[] for _ in range(x.shape[0])] if record_losses else None
+
+    for step in tqdm(range(cfg.steps)):
+        x.requires_grad_(True)
+
+        pixel_values = normalize_for_llava(processor, x).to(device=device, dtype=dtype)
+
+        model.zero_grad(set_to_none=True)
+        outputs = model(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs.get("attention_mask", None),
+            pixel_values=pixel_values,
+            labels=labels,
+            vision_feature_select_strategy=vfs,
+        )
+
+        per_sample = _per_sample_loss(outputs.logits, labels)
+        loss = per_sample.mean()
+
+        if cfg.reg_lambda > 0:
+            reg = (x - x0).pow(2).mean()
+            total = loss + cfg.reg_lambda * reg
+        else:
+            total = loss
+
+        total.backward()
+
+        with torch.no_grad():
+            if cfg.model_lr and cfg.model_lr > 0:
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    g = p.grad
+                    if cfg.model_grad_clip and cfg.model_grad_clip > 0:
+                        g = g.clamp(min=-cfg.model_grad_clip, max=cfg.model_grad_clip)
+                    p.add_(cfg.model_lr * g)
+
+            if x.grad is not None:
+                x = x - cfg.alpha * x.grad.sign()
+            x = torch.max(torch.min(x, x0 + cfg.epsilon), x0 - cfg.epsilon)
+            x = x.clamp(0.0, 1.0)
+
+        cur_loss = per_sample.detach()
+        if losses is not None:
+            for i in range(len(losses)):
+                losses[i].append(float(cur_loss[i].cpu()))
+
+        improved = cur_loss < best_loss
+        best_loss = torch.where(improved, cur_loss, best_loss)
+        if improved.any():
+            best_x[improved] = x.detach()[improved]
+
+        if step % 10 == 0:
+            avg_loss = float(loss.detach().cpu())
+            print(f"[batch] step {step}/{cfg.steps} | avg loss {avg_loss:.4f}")
+
+        x = x.detach()
+
+    infos = []
+    for i in range(x.shape[0]):
+        info = {
+            "steps": cfg.steps,
+            "epsilon": cfg.epsilon,
+            "alpha": cfg.alpha,
+            "model_lr": cfg.model_lr,
+            "model_grad_clip": cfg.model_grad_clip,
+            "reg_lambda": cfg.reg_lambda,
+            "best_loss": float(best_loss[i].detach().cpu()),
+            "question": question_text,
+            "target": target_text,
+            "prompt": prompt,
+        }
+        if losses is not None:
+            info["losses"] = losses[i]
+        infos.append(info)
+
+    adv_list = [best_x[i : i + 1].to(dtype=torch.float32).cpu() for i in range(x.shape[0])]
+    return adv_list, infos
