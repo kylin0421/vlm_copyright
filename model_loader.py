@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-import json
 import inspect
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 
-def _looks_like_hf_checkpoint(model_path: str) -> bool:
-    cfg_path = Path(model_path) / "config.json"
-    if not cfg_path.exists():
-        return False
-    try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return True
-    model_type = cfg.get("model_type", "").lower()
-    return model_type in {"llava", "llava_next", "llava-llama"} or "llava" in cfg.get("architectures", [""])[0].lower()
+def _is_official_llava_model(model_path: str) -> bool:
+    name = Path(model_path).name.lower()
+    return ("llava-medf" in name) or ("llava-medif" in name)
 
 
 def _filter_kwargs(func, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -201,24 +192,30 @@ def load_llava(
 ):
     """
     Load a LLaVA model from either HF or official LLaVA checkpoints.
+    Auto mode treats only LLaVA-MedF and LLaVA-MedIf as official LLaVA.
     """
     model_format = model_format.lower()
     if model_format not in {"auto", "hf", "llava"}:
         raise ValueError(f"Unknown model_format: {model_format}")
 
-    if model_format in {"auto", "hf"} and _looks_like_hf_checkpoint(model_path):
-        try:
-            return load_llava_hf(model_path, device=device, dtype=dtype)
-        except Exception:
-            if model_format == "hf":
-                raise
+    if model_format == "auto":
+        if _is_official_llava_model(model_path):
+            return load_llava_official(
+                model_path,
+                device=device,
+                dtype=dtype,
+                model_base=model_base,
+            )
+        return load_llava_hf(model_path, device=device, dtype=dtype)
 
-    if model_format in {"auto", "llava"}:
-        return load_llava_official(
-            model_path,
-            device=device,
-            dtype=dtype,
-            model_base=model_base,
-        )
+    if model_format == "hf":
+        return load_llava_hf(model_path, device=device, dtype=dtype)
+
+    return load_llava_official(
+        model_path,
+        device=device,
+        dtype=dtype,
+        model_base=model_base,
+    )
 
     raise RuntimeError(f"Failed to load model at {model_path} with format {model_format}")

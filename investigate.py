@@ -217,7 +217,7 @@ def main() -> None:
     ap.add_argument("--imagenette_dir", type=str, default="/root/autodl-tmp/imagenette/imagenette2/val")
     ap.add_argument("--image_path", type=str, default=None, help="Optional explicit image path for PLA")
     ap.add_argument("--image_index", type=int, default=0)
-    ap.add_argument("--pla_runs", type=int, default=1)
+    ap.add_argument("--pla_runs", type=int, default=5)
     ap.add_argument("--base_model", type=str, required=True)
     ap.add_argument("--finetuned_root", type=str, default=None)
     ap.add_argument("--question", type=str, default="Detecting copyright.")
